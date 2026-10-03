@@ -6,5 +6,8 @@
   "provider": "groq",
   "model": "openai/gpt-oss-120b",
   "temperature": 0.4,
-  "maxTokens": 1800
+  "maxTokens": 1800,
+  "maxToolSteps": 3,
+  "rateLimitRetryDelaySeconds": 30,
+  "maxRateLimitRetries": 1
 }

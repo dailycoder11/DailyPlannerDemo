@@ -9,11 +9,13 @@ import time
 import uuid
 from datetime import date, datetime, time as day_time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import streamlit as st
 from dotenv import load_dotenv
-from groq import Groq
+from groq import Groq, RateLimitError
+
+from tools.registry import TOOL_DEFINITIONS, dispatch_tool
 
 from config.settings import ROOT_DIR, load_settings
 
@@ -35,6 +37,7 @@ def setup_logging() -> logging.Logger:
 
 
 LOGGER = setup_logging()
+MAX_TOOL_STEPS = 3
 
 
 def log_invocation(record: dict[str, Any]) -> None:
@@ -51,14 +54,14 @@ def build_itinerary(
     currency: str,
     start_time: day_time,
     return_time: day_time,
+    on_rate_limit_wait: Callable[[int], None] | None = None,
 ) -> tuple[str | None, str | None]:
-    """Call Groq and log metadata for every attempted model invocation."""
+    """Call Groq with native function tools until it returns a final itinerary."""
     invocation_id = str(uuid.uuid4())
     started = time.monotonic()
     status = "error"
     error_message = None
-    usage = None
-    itinerary = None
+    total_usage = {"promptTokens": 0, "completionTokens": 0, "totalTokens": 0}
     input_details = {
         "destination": destination,
         "date": trip_date.isoformat(),
@@ -76,53 +79,169 @@ def build_itinerary(
             error_message = "GROQ_API_KEY is missing."
             return None, "Planner service is not configured. Add GROQ_API_KEY to your .env file and restart Streamlit."
 
-        client = Groq(api_key=api_key, timeout=45.0, max_retries=1)
+        client = Groq(api_key=api_key, timeout=45.0, max_retries=0)
         total_budget = budget_per_person * people
-        completion = client.chat.completions.create(
-            model=SETTINGS["model"],
-            temperature=float(SETTINGS.get("temperature", 0.4)),
-            max_tokens=int(SETTINGS.get("maxTokens", 1800)),
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a practical local day-trip planner. Create a realistic itinerary that respects "
-                        "the provided time window and per-person budget. Be concise and use Markdown headings, "
-                        "times, clear activity descriptions, travel notes, and a budget estimate. Do not claim "
-                        "live availability or exact prices; label costs as estimates. If local information is "
-                        "uncertain, say so briefly."
-                    ),
-                },
-                {
+        system_prompt = (
+            "You are a trip-planning assistant.\n\n"
+            "Use the available tools whenever factual information about attractions, weather or travel time is needed.\n"
+            "Do not invent facts that can be obtained from a tool.\n"
+            "Gather enough information before creating the final itinerary.\n"
+            "You may call each available tool at most once per trip request. Do not repeat a tool call.\n"
+            "Avoid unnecessary tool calls.\n"
+            "When sufficient information is available, produce a clear chronological trip plan that respects the user's "
+            "start time, end time, group size and budget. Label prices as estimates and do not claim live availability."
+        )
+        user_prompt = (
+            f"Plan a day trip to {destination} on {trip_date.isoformat()} for {people} "
+            f"{'person' if people == 1 else 'people'}. Trip window: {start_time:%H:%M} to "
+            f"{return_time:%H:%M} (local time). Maximum budget: {currency} {budget_per_person:.2f} "
+            f"per person, {currency} {total_budget:.2f} total. Suggest an itinerary and estimate "
+            "costs per person and for the group. Transport and interests can be inferred; call out "
+            "important assumptions."
+        )
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        tool_steps = 0
+        max_tool_steps = int(SETTINGS.get("maxToolSteps", MAX_TOOL_STEPS))
+        tools_enabled = True
+        retry_delay = max(0, int(SETTINGS.get("rateLimitRetryDelaySeconds", 30)))
+        max_rate_limit_retries = max(0, int(SETTINGS.get("maxRateLimitRetries", 1)))
+        llm_call_index = 0
+
+        while True:
+            rate_limit_retries = 0
+            while True:
+                llm_call_index += 1
+                call_started = time.monotonic()
+                request_messages = json.loads(json.dumps(messages, ensure_ascii=False))
+                completion = None
+                call_error = None
+                call_status = "response_received"
+                should_retry = False
+                try:
+                    completion = client.chat.completions.create(
+                        model=SETTINGS["model"],
+                        temperature=float(SETTINGS.get("temperature", 0.4)),
+                        max_tokens=int(SETTINGS.get("maxTokens", 1800)),
+                        messages=messages,
+                        tools=TOOL_DEFINITIONS if tools_enabled else None,
+                        tool_choice="auto" if tools_enabled else "none",
+                    )
+                except RateLimitError as exc:
+                    call_error = f"{type(exc).__name__}: {exc}"
+                    error_text = (str(exc) + " " + json.dumps(getattr(exc, "body", None), default=str)).lower()
+                    is_tpm_limit = "tokens per minute" in error_text or "tpm" in error_text
+                    should_retry = is_tpm_limit and rate_limit_retries < max_rate_limit_retries
+                    call_status = "rate_limit_retry" if should_retry else "rate_limit_error"
+                    if not should_retry:
+                        raise
+                except Exception as exc:
+                    call_error = f"{type(exc).__name__}: {exc}"
+                    call_status = "error"
+                    raise
+                finally:
+                    response_record: dict[str, Any] = {"error": call_error} if call_error else {}
+                    if completion is not None:
+                        response_record = completion.model_dump(mode="json")
+                        usage_data = getattr(completion, "usage", None)
+                        if usage_data:
+                            total_usage["promptTokens"] += getattr(usage_data, "prompt_tokens", 0) or 0
+                            total_usage["completionTokens"] += getattr(usage_data, "completion_tokens", 0) or 0
+                            total_usage["totalTokens"] += getattr(usage_data, "total_tokens", 0) or 0
+                    log_invocation({
+                        "timestamp": datetime.now().astimezone().isoformat(),
+                        "invocationId": invocation_id,
+                        "callIndex": llm_call_index,
+                        "provider": SETTINGS.get("provider", "groq"),
+                        "model": SETTINGS.get("model"),
+                        "status": call_status,
+                        "durationMs": round((time.monotonic() - call_started) * 1000),
+                        "prompt": {
+                            "messages": request_messages,
+                            "tools": TOOL_DEFINITIONS if tools_enabled else None,
+                            "toolChoice": "auto" if tools_enabled else "none",
+                            "temperature": float(SETTINGS.get("temperature", 0.4)),
+                            "maxTokens": int(SETTINGS.get("maxTokens", 1800)),
+                        },
+                        "response": response_record,
+                    })
+
+                if not should_retry:
+                    break
+                rate_limit_retries += 1
+                print(f"[LLM] token-per-minute limit reached; retrying in {retry_delay} seconds")
+                for remaining in range(retry_delay, 0, -1):
+                    if on_rate_limit_wait:
+                        on_rate_limit_wait(remaining)
+                    time.sleep(1)
+
+            choice = completion.choices[0]
+            assistant_message = choice.message
+            tool_calls = assistant_message.tool_calls or []
+            if not tool_calls:
+                itinerary = assistant_message.content
+                print("[LLM] returned final answer")
+                if not itinerary or not itinerary.strip():
+                    status = "invalid_response"
+                    error_message = "Groq returned an empty final answer."
+                    return None, "The planner returned an empty itinerary. Please try again."
+                status = "success"
+                return itinerary, None
+
+            messages.append({
+                "role": "assistant",
+                "content": assistant_message.content,
+                "tool_calls": [call.model_dump(mode="json") for call in tool_calls],
+            })
+            for tool_call in tool_calls:
+                name = tool_call.function.name
+                if not tools_enabled or tool_steps >= max_tool_steps:
+                    print(f"[TOOL] {name} skipped: tool-call limit reached")
+                    result_content = json.dumps({
+                        "error": "No more tool calls are possible for this trip. Continue using the information already gathered and produce the itinerary."
+                    })
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": name,
+                        "content": result_content,
+                    })
+                    continue
+
+                tool_steps += 1
+                arguments = tool_call.function.arguments
+                print(f"[LLM] requested tool: {name}")
+                try:
+                    tool_result = dispatch_tool(name, arguments)
+                    print(f"[TOOL] {name} completed")
+                    result_content = json.dumps(tool_result, ensure_ascii=False, default=str)
+                except Exception as tool_error:
+                    print(f"[TOOL] {name} failed: {type(tool_error).__name__}: {tool_error}")
+                    result_content = json.dumps({"error": str(tool_error)})
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "name": name,
+                    "content": result_content,
+                })
+
+            if tool_steps >= max_tool_steps and tools_enabled:
+                tools_enabled = False
+                messages.append({
                     "role": "user",
                     "content": (
-                        f"Plan a day trip to {destination} on {trip_date.isoformat()} for {people} "
-                        f"{'person' if people == 1 else 'people'}. Trip window: {start_time:%H:%M} to "
-                        f"{return_time:%H:%M} (local time). Maximum budget: {currency} {budget_per_person:.2f} "
-                        f"per person, {currency} {total_budget:.2f} total. Suggest an itinerary and estimate "
-                        "costs per person and for the group. Transport and interests can be inferred; call out "
-                        "important assumptions."
+                        f"The limit of {max_tool_steps} tool calls has been reached. No more tool calls are possible. "
+                        "Use the information already gathered, state any uncertainty, and provide the best complete "
+                        "chronological itinerary you can. Do not request additional tools."
                     ),
-                },
-            ],
-        )
-        itinerary = completion.choices[0].message.content
-        if not itinerary or not itinerary.strip():
-            status = "invalid_response"
-            error_message = "Groq returned an empty response."
-            return None, "The planner returned an empty itinerary. Please try again."
-
-        usage_data = getattr(completion, "usage", None)
-        if usage_data:
-            usage = {
-                "promptTokens": getattr(usage_data, "prompt_tokens", None),
-                "completionTokens": getattr(usage_data, "completion_tokens", None),
-                "totalTokens": getattr(usage_data, "total_tokens", None),
-            }
-        status = "success"
-        return itinerary, None
+                })
+    except RateLimitError as error:
+        status = "rate_limit_error"
+        error_message = f"{type(error).__name__}: {error}"
+        return None, "Groq’s token limit is still exhausted after the retry. Please wait a little longer and try again."
     except Exception as error:  # Provider exceptions vary across SDK/API versions.
-        status = "provider_error"
         error_message = f"{type(error).__name__}: {error}"
         return None, "We couldn’t reach the planner service. Please try again in a moment."
     finally:
@@ -134,15 +253,12 @@ def build_itinerary(
             "status": status,
             "durationMs": round((time.monotonic() - started) * 1000),
         }
-        if usage:
-            record["usage"] = usage
+        record["usage"] = total_usage
         if error_message:
             record["error"] = error_message
-        if SETTINGS.get("logRequestAndResponse", False):
-            record["input"] = input_details
-            if itinerary:
-                record["response"] = itinerary
-        log_invocation(record)
+        # Each LLM request/response pair is logged in the loop above, including
+        # intermediate tool calls. This summary ties them together by invocationId.
+        LOGGER.info(json.dumps(record, ensure_ascii=False, default=str))
 
 
 st.set_page_config(
@@ -238,6 +354,14 @@ if submitted:
     elif budget_per_person <= 0:
         st.error("Enter a budget greater than zero per person.")
     else:
+        rate_limit_notice = st.empty()
+
+        def show_rate_limit_wait(seconds_remaining: int) -> None:
+            rate_limit_notice.warning(
+                "Groq’s token-per-minute limit was reached. We’ll automatically try again "
+                f"in {seconds_remaining} seconds."
+            )
+
         with st.spinner("Putting your day together…"):
             itinerary, error = build_itinerary(
                 destination=destination.strip(),
@@ -247,7 +371,9 @@ if submitted:
                 currency=currency,
                 start_time=start_time,
                 return_time=return_time,
+                on_rate_limit_wait=show_rate_limit_wait,
             )
+        rate_limit_notice.empty()
         if error:
             st.error(error)
         elif itinerary:
