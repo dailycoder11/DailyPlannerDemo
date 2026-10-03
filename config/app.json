@@ -1,0 +1,10 @@
+{
+  "appName": "Daytrip",
+  "port": 3000,
+  "logFile": "logs/invocations.jsonl",
+  "logRequestAndResponse": false,
+  "provider": "groq",
+  "model": "openai/gpt-oss-120b",
+  "temperature": 0.4,
+  "maxTokens": 1800
+}

@@ -1,0 +1,5 @@
+Plan mode :
+
+I want to build a small application a day planner with a simple UI that takes few simple inouts. 1) date of plannig a trip 2) number of peppe 3) cost per person , 4) start time 5) return time from use and then hits LLM ( open router LLM ) to get the plan and shows it user . Please ask any questions you have. the call to LLM will be groq service provider running gpt-oss-70B or any similar model . and all invocations made should be logged in a log file.i want this code in python and stream lit
+
+
