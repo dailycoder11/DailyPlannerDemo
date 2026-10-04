@@ -7,6 +7,7 @@
   "model": "openai/gpt-oss-120b",
   "temperature": 0.4,
   "maxTokens": 1800,
+  "maxLlmCallsPerRequest": 50,
   "maxToolSteps": 3,
   "rateLimitRetryDelaySeconds": 30,
   "maxRateLimitRetries": 1

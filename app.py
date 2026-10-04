@@ -15,7 +15,8 @@ import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq, RateLimitError
 
-from tools.registry import TOOL_DEFINITIONS, dispatch_tool
+from tools.harness import ToolCallHarness, TOOL_LIMIT_MESSAGE, WEATHER_DATE_REJECTION
+from tools.registry import TOOL_DEFINITIONS
 
 from config.settings import ROOT_DIR, load_settings
 
@@ -103,9 +104,14 @@ def build_itinerary(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        tool_steps = 0
-        max_tool_steps = int(SETTINGS.get("maxToolSteps", MAX_TOOL_STEPS))
+        max_tool_steps = min(MAX_TOOL_STEPS, max(0, int(SETTINGS.get("maxToolSteps", MAX_TOOL_STEPS))))
+        harness = ToolCallHarness(
+            trip_start_date=trip_date,
+            trip_end_date=trip_date,
+            max_successful_calls=max_tool_steps,
+        )
         tools_enabled = True
+        max_llm_calls = min(50, max(1, int(SETTINGS.get("maxLlmCallsPerRequest", 50))))
         retry_delay = max(0, int(SETTINGS.get("rateLimitRetryDelaySeconds", 30)))
         max_rate_limit_retries = max(0, int(SETTINGS.get("maxRateLimitRetries", 1)))
         llm_call_index = 0
@@ -113,6 +119,14 @@ def build_itinerary(
         while True:
             rate_limit_retries = 0
             while True:
+                if llm_call_index >= max_llm_calls:
+                    status = "llm_call_limit_reached"
+                    error_message = f"Maximum of {max_llm_calls} LLM calls reached for this request."
+                    print(f"[LLM] request call limit reached ({max_llm_calls})")
+                    return None, (
+                        f"The planner reached its limit of {max_llm_calls} LLM calls for this request. "
+                        "Please submit a new request to start a fresh plan."
+                    )
                 llm_call_index += 1
                 call_started = time.monotonic()
                 request_messages = json.loads(json.dumps(messages, ensure_ascii=False))
@@ -195,31 +209,51 @@ def build_itinerary(
                 "content": assistant_message.content,
                 "tool_calls": [call.model_dump(mode="json") for call in tool_calls],
             })
+            limit_reached_this_turn = False
             for tool_call in tool_calls:
                 name = tool_call.function.name
-                if not tools_enabled or tool_steps >= max_tool_steps:
-                    print(f"[TOOL] {name} skipped: tool-call limit reached")
-                    result_content = json.dumps({
-                        "error": "No more tool calls are possible for this trip. Continue using the information already gathered and produce the itinerary."
-                    })
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": name,
-                        "content": result_content,
-                    })
-                    continue
-
-                tool_steps += 1
                 arguments = tool_call.function.arguments
-                print(f"[LLM] requested tool: {name}")
                 try:
-                    tool_result = dispatch_tool(name, arguments)
-                    print(f"[TOOL] {name} completed")
-                    result_content = json.dumps(tool_result, ensure_ascii=False, default=str)
-                except Exception as tool_error:
-                    print(f"[TOOL] {name} failed: {type(tool_error).__name__}: {tool_error}")
-                    result_content = json.dumps({"error": str(tool_error)})
+                    parsed_for_trace = json.loads(arguments) if isinstance(arguments, str) else arguments
+                except (TypeError, ValueError):
+                    parsed_for_trace = {}
+                requested_date = parsed_for_trace.get("trip_date") if isinstance(parsed_for_trace, dict) else None
+                suffix = f": {requested_date}" if name == "get_weather" and requested_date else ""
+                print(f"[LLM] requested {name}{suffix}")
+
+                if not tools_enabled:
+                    tool_result = {"error": TOOL_LIMIT_MESSAGE}
+                    print("[HARNESS] BLOCKED - tool-call limit reached")
+                    limit_reached_this_turn = True
+                else:
+                    parsed, signature, rejection = harness.validate(name, arguments)
+                    if rejection:
+                        if rejection == "duplicate request":
+                            tool_result = {"error": "This identical tool request has already completed. Choose a different request or continue with the information available."}
+                            print("[HARNESS] BLOCKED - duplicate request")
+                        elif rejection == "tool-call limit reached":
+                            tool_result = {"error": TOOL_LIMIT_MESSAGE}
+                            print("[HARNESS] BLOCKED - tool-call limit reached")
+                            tools_enabled = False
+                            limit_reached_this_turn = True
+                        else:
+                            tool_result = {"error": rejection}
+                            if rejection == WEATHER_DATE_REJECTION:
+                                print("[HARNESS] BLOCKED - date outside trip range")
+                            else:
+                                print(f"[HARNESS] BLOCKED - {rejection}")
+                    else:
+                        print("[HARNESS] ALLOWED")
+                        tool_result, succeeded = harness.execute_validated(name, parsed or {}, signature or "")
+                        if succeeded:
+                            print(f"[TOOL {harness.successful_call_count}/{max_tool_steps}] completed")
+                            if harness.successful_call_count >= max_tool_steps:
+                                tools_enabled = False
+                                limit_reached_this_turn = True
+                        else:
+                            print(f"[TOOL] {name} failed")
+
+                result_content = json.dumps(tool_result, ensure_ascii=False, default=str)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -227,15 +261,10 @@ def build_itinerary(
                     "content": result_content,
                 })
 
-            if tool_steps >= max_tool_steps and tools_enabled:
-                tools_enabled = False
+            if limit_reached_this_turn:
                 messages.append({
                     "role": "user",
-                    "content": (
-                        f"The limit of {max_tool_steps} tool calls has been reached. No more tool calls are possible. "
-                        "Use the information already gathered, state any uncertainty, and provide the best complete "
-                        "chronological itinerary you can. Do not request additional tools."
-                    ),
+                    "content": TOOL_LIMIT_MESSAGE,
                 })
     except RateLimitError as error:
         status = "rate_limit_error"
