@@ -15,6 +15,7 @@ import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq, RateLimitError
 
+from evals.trip_evaluator import MAX_REVISIONS, evaluate_itinerary
 from tools.harness import ToolCallHarness, TOOL_LIMIT_MESSAGE, WEATHER_DATE_REJECTION
 from tools.registry import TOOL_DEFINITIONS
 
@@ -56,13 +57,14 @@ def build_itinerary(
     start_time: day_time,
     return_time: day_time,
     on_rate_limit_wait: Callable[[int], None] | None = None,
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, dict[str, Any] | None, str | None]:
     """Call Groq with native function tools until it returns a final itinerary."""
     invocation_id = str(uuid.uuid4())
     started = time.monotonic()
     status = "error"
     error_message = None
     total_usage = {"promptTokens": 0, "completionTokens": 0, "totalTokens": 0}
+    revision_count = 0
     input_details = {
         "destination": destination,
         "date": trip_date.isoformat(),
@@ -78,7 +80,7 @@ def build_itinerary(
         if not api_key or api_key == "your_groq_api_key":
             status = "configuration_error"
             error_message = "GROQ_API_KEY is missing."
-            return None, "Planner service is not configured. Add GROQ_API_KEY to your .env file and restart Streamlit."
+            return None, None, "Planner service is not configured. Add GROQ_API_KEY to your .env file and restart Streamlit."
 
         client = Groq(api_key=api_key, timeout=45.0, max_retries=0)
         total_budget = budget_per_person * people
@@ -90,7 +92,12 @@ def build_itinerary(
             "You may call each available tool at most once per trip request. Do not repeat a tool call.\n"
             "Avoid unnecessary tool calls.\n"
             "When sufficient information is available, produce a clear chronological trip plan that respects the user's "
-            "start time, end time, group size and budget. Label prices as estimates and do not claim live availability."
+            "start time, end time, group size and budget. Label prices as estimates and do not claim live availability.\n"
+            "Return the final itinerary as ONLY a valid JSON object with this shape: "
+            "{\"cost_per_person\": number, \"activities\": [{\"date\": \"YYYY-MM-DD\", "
+            "\"start_time\": \"HH:MM\", \"end_time\": \"HH:MM\", \"title\": string, "
+            "\"category\": \"activity or meal\", \"description\": string}]}. "
+            "Include at least two activities and a lunch or meal activity; order activities chronologically."
         )
         user_prompt = (
             f"Plan a day trip to {destination} on {trip_date.isoformat()} for {people} "
@@ -123,7 +130,7 @@ def build_itinerary(
                     status = "llm_call_limit_reached"
                     error_message = f"Maximum of {max_llm_calls} LLM calls reached for this request."
                     print(f"[LLM] request call limit reached ({max_llm_calls})")
-                    return None, (
+                    return None, None, (
                         f"The planner reached its limit of {max_llm_calls} LLM calls for this request. "
                         "Please submit a new request to start a fresh plan."
                     )
@@ -197,12 +204,36 @@ def build_itinerary(
             if not tool_calls:
                 itinerary = assistant_message.content
                 print("[LLM] returned final answer")
-                if not itinerary or not itinerary.strip():
-                    status = "invalid_response"
-                    error_message = "Groq returned an empty final answer."
-                    return None, "The planner returned an empty itinerary. Please try again."
-                status = "success"
-                return itinerary, None
+                evaluation = evaluate_itinerary(
+                    itinerary or "",
+                    budget_per_person=budget_per_person,
+                    requested_start_time=start_time,
+                    requested_end_time=return_time,
+                    trip_start_date=trip_date,
+                    trip_end_date=trip_date,
+                )
+                for check_name, check_status in evaluation["checks"].items():
+                    print(f"[EVAL] {check_name}: {check_status}")
+                print(f"[EVAL] overall: {evaluation['status']}")
+                if evaluation["status"] == "FAIL" and revision_count < MAX_REVISIONS:
+                    revision_count += 1
+                    print(f"[REVISION {revision_count}/{MAX_REVISIONS}]")
+                    messages.append({"role": "assistant", "content": itinerary or ""})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Revise the itinerary to address these deterministic evaluation failures: "
+                            f"{json.dumps(evaluation['failures'], ensure_ascii=False)}. Use information already "
+                            "collected in this conversation and do not invent factual details. Return ONLY a valid "
+                            "JSON object with cost_per_person and an activities array; each activity must have date, "
+                            "start_time, end_time, title, category, and description. Keep the activities chronological, "
+                            "within the requested trip dates and times, within the per-person budget, and include "
+                            "at least two activities and a lunch or meal."
+                        ),
+                    })
+                    continue
+                status = "success" if evaluation["status"] == "PASS" else "evaluation_failed"
+                return itinerary or "", evaluation, None
 
             messages.append({
                 "role": "assistant",
@@ -269,10 +300,10 @@ def build_itinerary(
     except RateLimitError as error:
         status = "rate_limit_error"
         error_message = f"{type(error).__name__}: {error}"
-        return None, "Groq’s token limit is still exhausted after the retry. Please wait a little longer and try again."
+        return None, None, "Groq’s token limit is still exhausted after the retry. Please wait a little longer and try again."
     except Exception as error:  # Provider exceptions vary across SDK/API versions.
         error_message = f"{type(error).__name__}: {error}"
-        return None, "We couldn’t reach the planner service. Please try again in a moment."
+        return None, None, "We couldn’t reach the planner service. Please try again in a moment."
     finally:
         record: dict[str, Any] = {
             "timestamp": datetime.now().astimezone().isoformat(),
@@ -288,6 +319,40 @@ def build_itinerary(
         # Each LLM request/response pair is logged in the loop above, including
         # intermediate tool calls. This summary ties them together by invocationId.
         LOGGER.info(json.dumps(record, ensure_ascii=False, default=str))
+
+
+def format_itinerary_for_display(content: str, currency: str) -> str:
+    """Render the model's structured itinerary inside the existing result panel."""
+    try:
+        plan = json.loads(content)
+    except (TypeError, json.JSONDecodeError):
+        return content
+    if not isinstance(plan, dict) or not isinstance(plan.get("activities"), list):
+        return content
+
+    lines = []
+    cost = plan.get("cost_per_person")
+    if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+        lines.append(f"**Estimated cost per person:** {currency} {cost:,.2f}")
+        lines.append("")
+    for activity in plan["activities"]:
+        if not isinstance(activity, dict):
+            continue
+        date_text = str(activity.get("date", ""))
+        start_text = str(activity.get("start_time", ""))
+        end_text = str(activity.get("end_time", ""))
+        title = str(activity.get("title", "Activity"))
+        category = str(activity.get("category", "")).strip()
+        description = str(activity.get("description", "")).strip()
+        timing = " – ".join(part for part in (start_text, end_text) if part)
+        heading = " · ".join(part for part in (timing, date_text, category) if part)
+        lines.append(f"### {title}")
+        if heading:
+            lines.append(f"_{heading}_")
+        if description:
+            lines.append(description)
+        lines.append("")
+    return "\n".join(lines).strip() or content
 
 
 st.set_page_config(
@@ -392,7 +457,7 @@ if submitted:
             )
 
         with st.spinner("Putting your day together…"):
-            itinerary, error = build_itinerary(
+            itinerary, evaluation, error = build_itinerary(
                 destination=destination.strip(),
                 trip_date=trip_date,
                 people=int(people),
@@ -407,6 +472,7 @@ if submitted:
             st.error(error)
         elif itinerary:
             st.session_state["itinerary"] = itinerary
+            st.session_state["evaluation"] = evaluation
             st.session_state["trip_summary"] = (
                 f"{destination.strip()} · {trip_date.strftime('%A, %B %-d, %Y')} · "
                 f"{int(people)} {'person' if int(people) == 1 else 'people'} · "
@@ -416,7 +482,14 @@ if submitted:
 if st.session_state.get("itinerary"):
     st.markdown('<div class="result-panel"><div class="section-kicker">YOUR DAY, THOUGHTFULLY PLANNED</div><h2>Your itinerary</h2>', unsafe_allow_html=True)
     st.caption(st.session_state.get("trip_summary", ""))
-    st.markdown(st.session_state["itinerary"])
+    evaluation = st.session_state.get("evaluation")
+    if evaluation:
+        if evaluation.get("status") == "PASS":
+            st.success("Itinerary checks passed.")
+        else:
+            failures = evaluation.get("failures", [])
+            st.warning("Itinerary needs review: " + "; ".join(failures))
+    st.markdown(format_itinerary_for_display(st.session_state["itinerary"], currency))
     st.caption("Costs and local suggestions are estimates. Please confirm timings and prices before you go.")
     st.markdown("</div>", unsafe_allow_html=True)
 
