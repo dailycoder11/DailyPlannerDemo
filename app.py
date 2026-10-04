@@ -15,6 +15,7 @@ import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq, RateLimitError
 
+from agents.critic import review_plan
 from evals.trip_evaluator import MAX_REVISIONS, evaluate_itinerary
 from memory.trip_memory import find_reusable_plan, save_successful_plan
 from tools.harness import ToolCallHarness, TOOL_LIMIT_MESSAGE, WEATHER_DATE_REJECTION
@@ -59,7 +60,7 @@ def build_itinerary(
     start_time: day_time,
     return_time: day_time,
     on_rate_limit_wait: Callable[[int], None] | None = None,
-) -> tuple[str | None, dict[str, Any] | None, str | None]:
+) -> tuple[str | None, dict[str, Any] | None, str | None, dict[str, Any]]:
     """Call Groq with native function tools until it returns a final itinerary."""
     invocation_id = str(uuid.uuid4())
     started = time.monotonic()
@@ -67,6 +68,7 @@ def build_itinerary(
     error_message = None
     total_usage = {"promptTokens": 0, "completionTokens": 0, "totalTokens": 0}
     revision_count = 0
+    successful_tool_facts: list[dict[str, Any]] = []
     input_details = {
         "destination": destination,
         "date": trip_date.isoformat(),
@@ -82,7 +84,7 @@ def build_itinerary(
         if not api_key or api_key == "your_groq_api_key":
             status = "configuration_error"
             error_message = "GROQ_API_KEY is missing."
-            return None, None, "Planner service is not configured. Add GROQ_API_KEY to your .env file and restart Streamlit."
+            return None, None, "Planner service is not configured. Add GROQ_API_KEY to your .env file and restart Streamlit.", {}
 
         client = Groq(api_key=api_key, timeout=45.0, max_retries=0)
         total_budget = budget_per_person * people
@@ -135,7 +137,7 @@ def build_itinerary(
                     return None, None, (
                         f"The planner reached its limit of {max_llm_calls} LLM calls for this request. "
                         "Please submit a new request to start a fresh plan."
-                    )
+                    ), {"tool_facts": successful_tool_facts, "llm_calls": llm_call_index}
                 llm_call_index += 1
                 call_started = time.monotonic()
                 request_messages = json.loads(json.dumps(messages, ensure_ascii=False))
@@ -235,7 +237,11 @@ def build_itinerary(
                     })
                     continue
                 status = "success" if evaluation["status"] == "PASS" else "evaluation_failed"
-                return itinerary or "", evaluation, None
+                return itinerary or "", evaluation, None, {
+                    "tool_facts": successful_tool_facts,
+                    "llm_calls": llm_call_index,
+                    "invocation_id": invocation_id,
+                }
 
             messages.append({
                 "role": "assistant",
@@ -279,6 +285,7 @@ def build_itinerary(
                         print("[HARNESS] ALLOWED")
                         tool_result, succeeded = harness.execute_validated(name, parsed or {}, signature or "")
                         if succeeded:
+                            successful_tool_facts.append({"name": name, "result": tool_result})
                             print(f"[TOOL {harness.successful_call_count}/{max_tool_steps}] completed")
                             if harness.successful_call_count >= max_tool_steps:
                                 tools_enabled = False
@@ -302,10 +309,10 @@ def build_itinerary(
     except RateLimitError as error:
         status = "rate_limit_error"
         error_message = f"{type(error).__name__}: {error}"
-        return None, None, "Groq’s token limit is still exhausted after the retry. Please wait a little longer and try again."
+        return None, None, "Groq’s token limit is still exhausted after the retry. Please wait a little longer and try again.", {}
     except Exception as error:  # Provider exceptions vary across SDK/API versions.
         error_message = f"{type(error).__name__}: {error}"
-        return None, None, "We couldn’t reach the planner service. Please try again in a moment."
+        return None, None, "We couldn’t reach the planner service. Please try again in a moment.", {}
     finally:
         record: dict[str, Any] = {
             "timestamp": datetime.now().astimezone().isoformat(),
@@ -361,7 +368,10 @@ def parse_structured_itinerary(content: str) -> dict[str, Any] | None:
     """Parse a final itinerary for memory persistence."""
     value = content.strip()
     if value.startswith("```"):
-        value = value.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        value = value[3:].strip()
+        if value[:4].casefold() == "json":
+            value = value[4:].strip()
+        value = value.removesuffix("```").strip()
     try:
         parsed = json.loads(value)
     except json.JSONDecodeError:
@@ -489,12 +499,13 @@ if submitted:
             itinerary = json.dumps(reused_plan, ensure_ascii=False)
             evaluation = memory_match.get("evaluation", {"status": "PASS", "checks": {}, "failures": []})
             error = None
+            planner_metadata = {"tool_facts": [], "llm_calls": 0, "invocation_id": str(uuid.uuid4())}
             st.session_state["memory_reused_from"] = source_date
         else:
             print("[MEMORY] no suitable match")
             print("[PLANNER] running normal flow")
             with st.spinner("Putting your day together…"):
-                itinerary, evaluation, error = build_itinerary(
+                itinerary, evaluation, error, planner_metadata = build_itinerary(
                     destination=destination.strip(),
                     trip_date=trip_date,
                     people=int(people),
@@ -529,6 +540,47 @@ if submitted:
                         print(f"[MEMORY] could not save trip plan: {save_error}")
                 else:
                     print("[MEMORY] PASS plan could not be parsed; skipping save")
+            critic_feedback = None
+            critic_plan = parse_structured_itinerary(itinerary)
+            if evaluation and evaluation.get("status") == "PASS" and critic_plan is not None:
+                request_limit = min(50, max(1, int(SETTINGS.get("maxLlmCallsPerRequest", 50))))
+                calls_used = int(planner_metadata.get("llm_calls", 0))
+                if calls_used >= request_limit:
+                    print("[CRITIC] skipped - LLM call limit reached")
+                    critic_feedback = {"status": "unavailable", "reason": "The request reached its LLM-call limit."}
+                else:
+                    print("[CRITIC] reviewing validated plan")
+                    critic_requirements = {
+                        "destination": destination.strip(),
+                        "trip_date": trip_date.isoformat(),
+                        "number_of_people": int(people),
+                        "budget_per_person": float(budget_per_person),
+                        "currency": currency,
+                        "start_time": start_time.strftime("%H:%M"),
+                        "end_time": return_time.strftime("%H:%M"),
+                    }
+                    try:
+                        critic_feedback = review_plan(
+                            api_key=os.getenv("GROQ_API_KEY", ""),
+                            model=SETTINGS.get("criticModel", "openai/gpt-oss-20b"),
+                            requirements=critic_requirements,
+                            plan=critic_plan,
+                            tool_facts=planner_metadata.get("tool_facts", []),
+                            invocation_id=planner_metadata.get("invocation_id", str(uuid.uuid4())),
+                            call_index=calls_used + 1,
+                            max_tokens=max(128, int(SETTINGS.get("criticMaxTokens", 600))),
+                            temperature=float(SETTINGS.get("criticTemperature", 0.2)),
+                            log_invocation=log_invocation,
+                        )
+                    except Exception as critic_error:
+                        # Critic failures never prevent displaying a validated itinerary.
+                        print(f"[CRITIC] review unavailable: {type(critic_error).__name__}: {critic_error}")
+                        critic_feedback = None
+                    if critic_feedback:
+                        print("[CRITIC] review completed")
+                    else:
+                        print("[CRITIC] review unavailable")
+            st.session_state["critic_feedback"] = critic_feedback
             st.session_state["itinerary"] = itinerary
             st.session_state["evaluation"] = evaluation
             st.session_state["trip_summary"] = (
@@ -550,6 +602,16 @@ if st.session_state.get("itinerary"):
             failures = evaluation.get("failures", [])
             st.warning("Itinerary needs review: " + "; ".join(failures))
     st.markdown(format_itinerary_for_display(st.session_state["itinerary"], currency))
+    critic_feedback = st.session_state.get("critic_feedback")
+    st.markdown("### Critic feedback")
+    if critic_feedback and critic_feedback.get("status") == "available":
+        st.write(critic_feedback["overall_feedback"])
+        suggestions = critic_feedback.get("suggestions", [])
+        if suggestions:
+            for suggestion in suggestions:
+                st.markdown(f"- {suggestion}")
+    else:
+        st.caption("Critic feedback is unavailable for this plan.")
     st.caption("Costs and local suggestions are estimates. Please confirm timings and prices before you go.")
     st.markdown("</div>", unsafe_allow_html=True)
 
