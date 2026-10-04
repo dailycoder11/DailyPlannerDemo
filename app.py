@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from groq import Groq, RateLimitError
 
 from evals.trip_evaluator import MAX_REVISIONS, evaluate_itinerary
+from memory.trip_memory import find_reusable_plan, save_successful_plan
 from tools.harness import ToolCallHarness, TOOL_LIMIT_MESSAGE, WEATHER_DATE_REJECTION
 from tools.registry import TOOL_DEFINITIONS
 
@@ -40,6 +41,7 @@ def setup_logging() -> logging.Logger:
 
 LOGGER = setup_logging()
 MAX_TOOL_STEPS = 3
+MEMORY_DIR = ROOT_DIR / "memory"
 
 
 def log_invocation(record: dict[str, Any]) -> None:
@@ -355,6 +357,18 @@ def format_itinerary_for_display(content: str, currency: str) -> str:
     return "\n".join(lines).strip() or content
 
 
+def parse_structured_itinerary(content: str) -> dict[str, Any] | None:
+    """Parse a final itinerary for memory persistence."""
+    value = content.strip()
+    if value.startswith("```"):
+        value = value.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 st.set_page_config(
     page_title=f"{SETTINGS.get('appName', 'Daytrip')} — a day well planned",
     page_icon="✳",
@@ -448,6 +462,7 @@ if submitted:
     elif budget_per_person <= 0:
         st.error("Enter a budget greater than zero per person.")
     else:
+        st.session_state.pop("memory_reused_from", None)
         rate_limit_notice = st.empty()
 
         def show_rate_limit_wait(seconds_remaining: int) -> None:
@@ -456,21 +471,64 @@ if submitted:
                 f"in {seconds_remaining} seconds."
             )
 
-        with st.spinner("Putting your day together…"):
-            itinerary, evaluation, error = build_itinerary(
-                destination=destination.strip(),
-                trip_date=trip_date,
-                people=int(people),
-                budget_per_person=float(budget_per_person),
-                currency=currency,
-                start_time=start_time,
-                return_time=return_time,
-                on_rate_limit_wait=show_rate_limit_wait,
-            )
+        print("[MEMORY] searching previous plans")
+        memory_match = find_reusable_plan(
+            MEMORY_DIR,
+            destination=destination.strip(),
+            trip_date=trip_date,
+            budget_per_person=float(budget_per_person),
+        )
+        if memory_match:
+            source_date = str(memory_match.get("trip_date", "unknown date"))
+            print(f"[MEMORY] match found: {memory_match.get('_filename', source_date)}")
+            print("[MEMORY] reusing validated plan")
+            reused_plan = memory_match["final_plan"]
+            for activity in reused_plan.get("activities", []):
+                if isinstance(activity, dict) and activity.get("date") == source_date:
+                    activity["date"] = trip_date.isoformat()
+            itinerary = json.dumps(reused_plan, ensure_ascii=False)
+            evaluation = memory_match.get("evaluation", {"status": "PASS", "checks": {}, "failures": []})
+            error = None
+            st.session_state["memory_reused_from"] = source_date
+        else:
+            print("[MEMORY] no suitable match")
+            print("[PLANNER] running normal flow")
+            with st.spinner("Putting your day together…"):
+                itinerary, evaluation, error = build_itinerary(
+                    destination=destination.strip(),
+                    trip_date=trip_date,
+                    people=int(people),
+                    budget_per_person=float(budget_per_person),
+                    currency=currency,
+                    start_time=start_time,
+                    return_time=return_time,
+                    on_rate_limit_wait=show_rate_limit_wait,
+                )
         rate_limit_notice.empty()
         if error:
             st.error(error)
         elif itinerary:
+            if evaluation and evaluation.get("status") == "PASS" and not memory_match:
+                final_plan = parse_structured_itinerary(itinerary)
+                if final_plan is not None:
+                    try:
+                        saved_path = save_successful_plan(
+                            MEMORY_DIR,
+                            destination=destination.strip(),
+                            trip_date=trip_date,
+                            budget_per_person=float(budget_per_person),
+                            people=int(people),
+                            start_time=start_time.strftime("%H:%M"),
+                            end_time=return_time.strftime("%H:%M"),
+                            evaluation=evaluation,
+                            final_plan=final_plan,
+                        )
+                        if saved_path:
+                            print("[MEMORY] saved new trip plan")
+                    except OSError as save_error:
+                        print(f"[MEMORY] could not save trip plan: {save_error}")
+                else:
+                    print("[MEMORY] PASS plan could not be parsed; skipping save")
             st.session_state["itinerary"] = itinerary
             st.session_state["evaluation"] = evaluation
             st.session_state["trip_summary"] = (
@@ -482,6 +540,8 @@ if submitted:
 if st.session_state.get("itinerary"):
     st.markdown('<div class="result-panel"><div class="section-kicker">YOUR DAY, THOUGHTFULLY PLANNED</div><h2>Your itinerary</h2>', unsafe_allow_html=True)
     st.caption(st.session_state.get("trip_summary", ""))
+    if st.session_state.get("memory_reused_from"):
+        st.caption(f"Reused a validated plan saved for {st.session_state['memory_reused_from']}.")
     evaluation = st.session_state.get("evaluation")
     if evaluation:
         if evaluation.get("status") == "PASS":

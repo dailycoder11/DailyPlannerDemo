@@ -1,0 +1,108 @@
+{
+  "destination": "Delhi",
+  "trip_date": "2026-10-08",
+  "budget_per_person": 2500.0,
+  "number_of_people": 2,
+  "start_time": "09:00",
+  "end_time": "19:00",
+  "created_time": "2026-10-04T12:40:23.022958+00:00",
+  "eval_status": "PASS",
+  "evaluation": {
+    "status": "PASS",
+    "checks": {
+      "format": "PASS",
+      "budget": "PASS",
+      "activity_count": "PASS",
+      "activity_dates": "PASS",
+      "start_time": "PASS",
+      "end_time": "PASS",
+      "meal": "PASS"
+    },
+    "failures": []
+  },
+  "final_plan": {
+    "cost_per_person": 2000,
+    "activities": [
+      {
+        "date": "2026-10-08",
+        "start_time": "09:00",
+        "end_time": "09:30",
+        "title": "Travel to Red Fort",
+        "category": "activity",
+        "description": "Take the Delhi Metro (Yellow Line) from your hotel to Chandni Chowk station; walk to Red Fort entrance."
+      },
+      {
+        "date": "2026-10-08",
+        "start_time": "09:30",
+        "end_time": "11:30",
+        "title": "Red Fort Exploration",
+        "category": "activity",
+        "description": "Guided entry to Red Fort (entry fee INR 500 per adult). Explore the historic Mughal architecture, Diwan-i-Aam, and the museum."
+      },
+      {
+        "date": "2026-10-08",
+        "start_time": "11:30",
+        "end_time": "12:00",
+        "title": "Snack Break at Chandni Chowk",
+        "category": "meal",
+        "description": "Enjoy a quick street‑food snack (e.g., jalebi or samosa) – approx. INR 100 per person."
+      },
+      {
+        "date": "2026-10-08",
+        "start_time": "12:00",
+        "end_time": "13:00",
+        "title": "Travel to Lunch at Karim’s",
+        "category": "activity",
+        "description": "Walk or take an auto‑rickshaw to Karim’s near Jama Masjid for a classic Mughlai lunch."
+      },
+      {
+        "date": "2026-10-08",
+        "start_time": "13:00",
+        "end_time": "14:00",
+        "title": "Lunch at Karim’s",
+        "category": "meal",
+        "description": "Traditional dishes such as mutton korma, chicken jahangiri, and naan. Estimated cost INR 400 per person."
+      },
+      {
+        "date": "2026-10-08",
+        "start_time": "14:00",
+        "end_time": "14:30",
+        "title": "Travel to Qutub Minar",
+        "category": "activity",
+        "description": "Take the Metro (Yellow to Violet line) to Qutub Minar station."
+      },
+      {
+        "date": "2026-10-08",
+        "start_time": "15:00",
+        "end_time": "16:30",
+        "title": "Qutub Minar Complex",
+        "category": "activity",
+        "description": "Entry to Qutub Minar and surrounding monuments (entry fee INR 600 per adult). Explore the tallest brick minaret, Iron Pillar, and historic ruins."
+      },
+      {
+        "date": "2026-10-08",
+        "start_time": "16:30",
+        "end_time": "17:00",
+        "title": "Travel to India Gate",
+        "category": "activity",
+        "description": "Short auto‑rickshaw ride to India Gate for a quick photo stop (free)."
+      },
+      {
+        "date": "2026-10-08",
+        "start_time": "17:00",
+        "end_time": "18:00",
+        "title": "Relax at India Gate",
+        "category": "activity",
+        "description": "Stroll around the memorial, enjoy the evening ambience, and take photos."
+      },
+      {
+        "date": "2026-10-08",
+        "start_time": "18:00",
+        "end_time": "18:30",
+        "title": "Return to Hotel",
+        "category": "activity",
+        "description": "Metro ride back to your accommodation."
+      }
+    ]
+  }
+}

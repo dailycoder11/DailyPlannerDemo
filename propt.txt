@@ -1,74 +1,65 @@
-I already have Phase 3 working with:
-- OpenRouter LLM
-- 3 tools
-- max 3 successful tool calls
-- duplicate-call blocking
-- weather-date guardrail
-- attraction result cap
-- tool allowlist/logging
+I already have Phase 4 working with deterministic evals and one revision loop.
 
-Now add **Phase 4: deterministic evals**.
+Now add **Phase 5: simple file-based memory**.
 
-Create a small evaluator module, e.g. `evals/trip_evaluator.py`.
+Create a `memory/` folder. Store each successful trip plan as one JSON file.
 
-Check the final itinerary for:
+Only save plans whose final eval status is `PASS`.
 
-1. cost/person <= user budget  
-2. start time >= requested start time  
-3. end time <= requested end time  
-4. at least 2 activities  
-5. lunch/meal included  
-6. all activities within trip start/end dates  
+Each memory file should contain at least:
 
-Return structured output like:
+- destination
+- trip date
+- budget per person
+- number of people
+- start time
+- end time
+- created time
+- eval status
+- final structured plan
 
-```json
-{
-  "status": "PASS",
-  "failures": []
-}
+Before running the normal planner, search existing memory files.
+
+A previous plan can be reused if:
+
+- destination/city matches,
+- trip date is within ±30 days of the requested trip date,
+- budget per person is within ±₹500.
+
+If multiple plans match, choose the closest by date, then budget.
+
+If a reusable memory is found:
+- skip LLM/tool planning,
+- load the stored final structured plan,
+- show that plan to the user,
+- log that memory was reused.
+
+If no memory matches:
+- run the existing Phase 4 flow normally,
+- after a successful PASS result, save the final plan as a new JSON memory file.
+
+Example logs:
+
+```text
+[MEMORY] searching previous plans
+[MEMORY] match found: bengaluru_2026-11-15_1000.json
+[MEMORY] reusing validated plan
 ```
 
 or:
 
-```json
-{
-  "status": "FAIL",
-  "failures": [
-    "Budget exceeded",
-    "Trip ends after requested end time"
-  ]
-}
-```
-
-If FAIL:
-- send the failure reasons back to the same LLM,
-- ask it to revise the plan using already collected information,
-- then run the evaluator again.
-
-Set:
-
-`MAX_REVISIONS = 1`
-
-Do not add another LLM judge, critic, Groq, multiple agents, MCP, or memory.
-
-Reuse the existing Phase 3 harness and tool limits during revision.
-
-Add simple logs:
-
 ```text
-[EVAL] budget: PASS
-[EVAL] end_time: FAIL
-[EVAL] overall: FAIL
-[REVISION 1/1]
-[EVAL] overall: PASS
+[MEMORY] no suitable match
+[PLANNER] running normal flow
+[EVAL] PASS
+[MEMORY] saved new trip plan
 ```
 
-If the current itinerary is only free text, make the smallest change needed so the evaluator can reliably read fields like dates, times, activities, lunch and cost.
+Keep this simple:
+- no vector DB
+- no embeddings
+- no LLM-based memory search
+- no summarization
+- no multiple agents
 
-Before coding, inspect the current code and briefly show:
-1. files to add/modify,
-2. where eval runs,
-3. how the single revision loop fits into the existing flow.
-
-Do not implement until I approve the plan.
+Before coding, briefly show files to add/modify and where memory lookup/save fits into the current flow.
